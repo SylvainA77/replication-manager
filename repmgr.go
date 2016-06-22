@@ -79,6 +79,7 @@ var (
 	httpport    string
 	httpserv    bool
 	daemon      bool
+	gtidmode    string
 )
 
 func init() {
@@ -120,6 +121,7 @@ func initRepmgrFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&bindaddr, "http-bind-address", "localhost", "Bind HTTP monitor to this IP address")
 	cmd.Flags().StringVar(&httpport, "http-port", "10001", "HTTP monitor to listen on this port")
 	cmd.Flags().BoolVar(&daemon, "daemon", false, "Daemon mode. Do not start the Termbox console")
+	cmd.Flags().StringVar(&gtidmode, "gtid-mode", "slave", "GTID position mode")
 	viper.BindPFlags(cmd.Flags())
 	preScript = viper.GetString("pre-failover-script")
 	postScript = viper.GetString("post-failover-script")

@@ -120,13 +120,21 @@ func masterFailover(fail bool) bool {
 			logprint("WARN : Could not unlock tables on old master", err)
 		}
 		dbhelper.StopSlave(oldMaster.Conn) // This is helpful because in some cases the old master can have an old configuration running
-		_, err = oldMaster.Conn.Exec("SET GLOBAL gtid_slave_pos='" + oldMaster.BinlogPos.Sprint() + "'")
-		if err != nil {
-			logprint("WARN : Could not set gtid_slave_pos on old master", err)
-		}
-		_, err = oldMaster.Conn.Exec(cm + ", master_use_gtid=slave_pos")
-		if err != nil {
-			logprint("WARN : Change master failed on old master", err)
+		switch gtidmode {
+		case "slave":
+			_, err = oldMaster.Conn.Exec("SET GLOBAL gtid_slave_pos='" + oldMaster.BinlogPos.Sprint() + "'")
+			if err != nil {
+				logprint("WARN : Could not set gtid_slave_pos on old master", err)
+			}
+			_, err = oldMaster.Conn.Exec(cm + ", master_use_gtid=slave_pos")
+			if err != nil {
+				logprint("WARN : Change master failed on old master", err)
+			}
+		case "current":
+			_, err = oldMaster.Conn.Exec(cm + ", master_use_gtid=CURRENT_POS")
+			if err != nil {
+				logprint("WARN : Change master failed on old master", err)
+			}
 		}
 		err = dbhelper.StartSlave(oldMaster.Conn)
 		if err != nil {
@@ -163,7 +171,7 @@ func masterFailover(fail bool) bool {
 		if err != nil {
 			logprintf("WARN : Could not stop slave on server %s, %s", sl.URL, err)
 		}
-		if fail == false {
+		if fail == false && gtidmode == "slave" {
 			_, err = sl.Conn.Exec("SET GLOBAL gtid_slave_pos='" + oldMaster.BinlogPos.Sprint() + "'")
 			if err != nil {
 				logprintf("WARN : Could not set gtid_slave_pos on slave %s, %s", sl.URL, err)
