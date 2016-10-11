@@ -785,7 +785,7 @@ func runAllTests() bool {
 	 if res == false {
 	 	ret = res
 	 }
-/*
+
 	res = testSwitchOverNoReadOnlyNoRplCheck()
 	allTests["1 Switchover <readonly=false> <rplchecks=false>"] = getTestResultLabel(res)
 	if res == false {
@@ -876,7 +876,7 @@ func runAllTests() bool {
 	if res == false {
 		ret = res
 	}
-  */
+  
 	keys := make([]string, 0, len(allTests))
 	for key := range allTests {
         keys = append(keys, key)
