@@ -20,8 +20,8 @@ prefmaster = "127.0.0.1:5012"
 # HTTP
 # ----
 
-http-server = true  
-http-bind-address = "0.0.0.0"   
+http-server = true
+http-bind-address = "0.0.0.0"
 http-port = "10001"
 http-root = "./dashboard"
 
@@ -37,7 +37,7 @@ mail-to = "mrm@mariadb.com"
 
 # Automatically rejoin a failed server to the current master
 # Slaves will re enter with read-only
-# Wait 5 seconds before killing long running transactions
+# Wait 5 seconds in failover for running transactions to finish then kill
 
 autorejoin = true
 readonly = true
@@ -47,18 +47,22 @@ pre-failover-script =""
 
 # CHECK
 # -----
+# if you plan to have multiple instances of replication manager in active/passive use  heartbeat-table = true
 
 check-type = "tcp"
+heartbeat-table = true
 
 # Failover after N failures detection
 # Monitoring is stopped after N failovers
 # Wait N seconds for next failover
 # Switchover only if one of the slaves is fully synced with the master (based on GTID equality)
 # Don't failover when replication pass delay
+# Don't switchover if detect long running trx
+
 
 failcount = 5
 failover-limit = 3
 failover-time-limit = 10
 gtidcheck = true
 maxdelay = 30
-
+wait-trx = 10

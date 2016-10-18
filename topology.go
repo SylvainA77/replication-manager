@@ -11,15 +11,15 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
-	"strings"
-	"sync"
-
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/tanji/replication-manager/dbhelper"
-	"github.com/tanji/replication-manager/state"
 	"github.com/tanji/replication-manager/misc"
+	"github.com/tanji/replication-manager/state"
+	"log"
+	"net"
+	"strings"
+	"sync"
 )
 
 type topologyError struct {
@@ -43,13 +43,8 @@ func newServerList() {
 		if verbose {
 			tlog.Add(fmt.Sprintf("DEBUG: New server created: %v", servers[k].URL))
 		}
-		if heartbeat {
-			err:=dbhelper.SetHeartbeatTable(servers[k].Conn)
-			if err != nil {
-					log.Fatalf("ERROR: Can not set heartbeat table to  %s  ",url)
-			}
-		}
-  }
+
+	}
 	// Spider shard discover
 	if spider == true {
 		SpiderShardsDiscovery()
@@ -87,27 +82,26 @@ func SpiderShardsDiscovery() {
 
 func SpiderSetShardsRepl() {
 	for k, s := range servers {
-		url:= s.URL
-		
+		url := s.URL
+
 		if heartbeat {
 			for _, s2 := range servers {
-			 url2:= s2.URL
-			 if url2!=url  {
+				url2 := s2.URL
+				if url2 != url {
 					host, port := misc.SplitHostPort(url2)
-					err:=dbhelper.SetHeartbeatTable(servers[k].Conn)
+					err := dbhelper.SetHeartbeatTable(servers[k].Conn)
 					if err != nil {
-							log.Fatalf("ERROR: Can not set heartbeat table to  %s  ",url)
+						log.Fatalf("ERROR: Can not set heartbeat table to  %s  ", url)
 					}
-					err=dbhelper.SetMultiSourceRepl(servers[k].Conn, host,port,rplUser, rplPass,"")
+					err = dbhelper.SetMultiSourceRepl(servers[k].Conn, host, port, rplUser, rplPass, "")
 					if err != nil {
-							log.Fatalf("ERROR: Can not set heartbeat replication from %s to %s : %s", url ,url2,err)
+						log.Fatalf("ERROR: Can not set heartbeat replication from %s to %s : %s", url, url2, err)
 					}
 				}
 			}
 		}
 	}
 }
-
 
 func pingServerList() {
 	if sme.IsInState("WARN00008") {
@@ -140,7 +134,27 @@ func pingServerList() {
 				}
 			}
 		}(sv)
+		// If not yet dicovered we can initiate hearbeat table on each node
+		if heartbeat {
+			if sme.IsDiscovered() == false {
+				err := dbhelper.SetHeartbeatTable(sv.Conn)
+				if err != nil {
+					sme.AddState("WARN00010", state.State{ErrType: "WARNING", ErrDesc: "Disable heartbeat table can't create table", ErrFrom: "RUN"})
+					heartbeat = false
+				}
+			}
+
+			if run_status == "A" && dbhelper.CheckHeartbeat(sv.Conn, run_uuid, "A") != true {
+				sme.AddState("ERR00019", state.State{ErrType: "ERROR", ErrDesc: "Multiple Active Replication Monitor Switching Passive Mode", ErrFrom: "RUN"})
+				run_status = "P"
+			}
+			if run_status == "P" {
+				sme.AddState("ERR00020", state.State{ErrType: "ERROR", ErrDesc: "Monitoring in Passive Mode Can't Failover", ErrFrom: "RUN"})
+			}
+			dbhelper.WriteHeartbeat(sv.Conn, run_uuid, run_status)
+		}
 	}
+
 	wg.Wait()
 }
 
@@ -191,12 +205,19 @@ func topologyDiscover() error {
 				master.State = stateMaster
 			}
 		}
-		// Check user privileges on live servers
+		// Check replication manager user privileges on live servers
 		if loglevel > 2 {
 			logprintf("DEBUG: Privilege check on %s", sv.URL)
 		}
 		if sv.State != stateFailed {
-			priv, err := dbhelper.GetPrivileges(sv.Conn, dbUser, repmgrHostname)
+
+			myhost := dbhelper.GetHostFromProcessList(sv.Conn, dbUser)
+			myip, err2 := net.LookupIP(myhost)
+
+			if err2 != nil {
+				sme.AddState("ERR00005", state.State{ErrType: "ERROR", ErrDesc: fmt.Sprintf("Error getting privileges for user %s@%s: %s", dbUser, sv.URL, err), ErrFrom: "CONF"})
+			}
+			priv, err := dbhelper.GetPrivileges(sv.Conn, dbUser, repmgrHostname, myip[0].String())
 			if err != nil {
 				sme.AddState("ERR00005", state.State{ErrType: "ERROR", ErrDesc: fmt.Sprintf("Error getting privileges for user %s@%s: %s", dbUser, repmgrHostname, err), ErrFrom: "CONF"})
 			}
@@ -210,16 +231,22 @@ func topologyDiscover() error {
 				sme.AddState("ERR00009", state.State{ErrType: "ERROR", ErrDesc: "User must have RELOAD privilege", ErrFrom: "CONF"})
 			}
 			// Check replication user has correct privs.
-			rpriv, err := dbhelper.GetPrivileges(sv.Conn, rplUser, repmgrHostname)
-			if err != nil {
-				sme.AddState("ERR00015", state.State{ErrType: "ERROR", ErrDesc: fmt.Sprintf("Error getting privileges for user %s on server %s: %s", rplUser, sv.URL, err), ErrFrom: "CONF"})
-			}
-			if rpriv.Repl_slave_priv == "N" {
-				sme.AddState("ERR00007", state.State{ErrType: "ERROR", ErrDesc: "User must have REPLICATION SLAVE privilege", ErrFrom: "CONF"})
-			}
-			// Additional health checks go here
-			if sv.acidTest() == false && sme.IsDiscovered() {
-				sme.AddState("WARN00007", state.State{ErrType: "WARN", ErrDesc: "At least one server is not ACID-compliant. Please check that the values of sync_binlog and innodb_flush_log_at_trx_commit are set to 1", ErrFrom: "CONF"})
+			for _, sv2 := range servers {
+				if sv2.URL != sv.URL {
+					rplhost, _ := net.LookupIP(sv2.Host)
+					//	fmt.Print("Found IP", rplhost[0])
+					rpriv, err := dbhelper.GetPrivileges(sv2.Conn, rplUser, sv2.Host, rplhost[0].String())
+					if err != nil {
+						sme.AddState("ERR00015", state.State{ErrType: "ERROR", ErrDesc: fmt.Sprintf("Error getting privileges for user %s on server %s: %s", rplUser, sv2.URL, err), ErrFrom: "CONF"})
+					}
+					if rpriv.Repl_slave_priv == "N" {
+						sme.AddState("ERR00007", state.State{ErrType: "ERROR", ErrDesc: "User must have REPLICATION SLAVE privilege", ErrFrom: "CONF"})
+					}
+					// Additional health checks go here
+					if sv.acidTest() == false && sme.IsDiscovered() {
+						sme.AddState("WARN00007", state.State{ErrType: "WARN", ErrDesc: "At least one server is not ACID-compliant. Please check that the values of sync_binlog and innodb_flush_log_at_trx_commit are set to 1", ErrFrom: "CONF"})
+					}
+				}
 			}
 		}
 	}
@@ -276,13 +303,13 @@ func topologyDiscover() error {
 	}
 
 	if slaves != nil {
-		 if len(slaves) >0 {
+		if len(slaves) > 0 {
 			// Depending if we are doing a failover or a switchover, we will find the master in the list of
 			// failed hosts or unconnected hosts.
 			// First of all, get a server id from the slaves slice, they should be all the same
 
-				sid := slaves[0].MasterServerID
-				for k, s := range servers {
+			sid := slaves[0].MasterServerID
+			for k, s := range servers {
 				if multiMaster == false && s.State == stateUnconn {
 					if s.ServerID == sid {
 						master = servers[k]
@@ -323,7 +350,7 @@ func topologyDiscover() error {
 				}
 			}
 		}
-  }
+	}
 	// Final check if master has been found
 	if master == nil {
 

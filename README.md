@@ -135,21 +135,21 @@ Probability to lose data is increased with a single slave topology, when the sla
 
 To limit such cases we advise usage of a 3 nodes cluster that removes some of such scenarios like losing a slave.
 
+This is the opportunity to work on long running WRITE transactions and split them in smaller chunks. Preferably we should minimize time in this state as failover would not be possible without big impact that  __replication-manager__ can force in interactive mode.  
+
+A good practice is to enable slow query detection on slaves using in slow query log
+
 ## State: Not in-sync & unfailable
 
 The first SLA is the one that tracks the presence of a valid topology from  __replication-manager__, when a leader is reachable but number of possible failovers exceeded, time before next failover not yet reached, no slave available to failover.
 
-
-This is the opportunity to work on long running WRITE transactions and split them in smaller chunks. Preferably we should minimize time in this state as failover would not be possible without big impact that  __replication-manager__ can force in interactive mode.  
-
-A good practice is to enable slow query detection on slaves using in slow query log
 ```
 log_slow_slave_statements = 1
 ```
 
-## Data consistency inside switchover
+## Preserving data consistency inside switchover
 
-__replication-manager__ prevents additional writes to set READ_ONLY flag on the old leader, if routers are still sending Write Transactions, they can pile-up until timeout, despite being killed by __replication-manager__.
+__replication-manager__ prevents additional writes setting READ_ONLY flag on the old leader, if routers are still sending Write Transactions, they can pile-up until timeout, despite being killed by __replication-manager__.
 
 Some additional caution to make sure that piled writes do not happen is that __replication-manager__ will decrease max_connections to the server to 1 and consume last possible connection by not killing himself. This works but to avoid a scenario where a node is left in a state where it cannot be connected anymore (crashing replication-manager in this critical section), we advise using extra port provided with MariaDB pool of threads feature:
 
@@ -178,6 +178,25 @@ GRANT SELECT ON mysql.tables_priv TO 'maxadmin'@'%';
 GRANT SHOW DATABASES, REPLICATION CLIENT ON *.* TO 'maxadmin'@'%';
 GRANT ALL ON maxscale_schema.* TO 'maxadmin'@'%';
 ```
+
+To additional preserve the workload it is also possible to enable replication-manager to drive maxscale by putting the old leader into maintenance mode this will block the traffic upfront, and prevent any external root user to pile up writes that would have by pass read only via excessive grants    
+
+```
+--maxscale                      Synchronize replication status with MaxScale proxy server
+--maxscale-host string          MaxScale host IP (default "127.0.0.1")
+--maxscale-pass string          MaxScale admin password (default "mariadb")
+--maxscale-port string          MaxScale admin port (default "6603")
+--maxscale-user string          MaxScale admin user (default "admin")
+```
+During switchover all existing connection will be killed  
+
+In switchover any slaves can be elected after it as apply all the replication events it as fetched __replication-manager__ will wait for promotion until this state.  
+
+In failover no preferred master can be used as __replication-manager__ will check the most up to date slave. It can be done only via checking the preferred master in first candidate
+
+## Preserving the workload during switchover
+
+It is dangerous to Kill a long running transaction, the rollback can take as long as the time of such transaction. To validate that this will not happen __replication-manager__ can check and cancel switchover if some long running transactions are found just before the switchover. It uses FLUSH TABLE and start monitoring the time it will take to proceed, after a timeout in second (wait-trx=10) the switchover will be cancelled. If flush table can proceed under the given timeout it means that all transactions starting after can safely be killed without taking long rollback time. This connetion killed will happen under a more heavy lock FTWTL to preserve data consistency during switchover.
 
 ## Procedural command line examples
 
@@ -298,20 +317,26 @@ The management user needs at least the following privileges: `SUPER`, `REPLICATI
 
 The replication user needs the following privilege: `REPLICATION SLAVE`
 
-## Default Failover Workflow
+## Default failover workflow in monitoring mode
 
-After checking the leader N times (failcount=5), replication-manager default behavior is to send an alert email and put itself in waiting mode until a user completes the failover or master self-heals.This is know as the On-call mode or configured via interactive = true.
+After checking the leader multiple times via the server protocol COM_PING  (failcount=5), replication-manager will send an alert email and put itself in waiting mode.
 
-When manual failover is triggered, conditions for a possible failover are checked. Per default a slave is available and up and running.
+This default was done for maximum confidence in deploying the tool, we wait for a user to completes the failover or leader self-heals. This mode is know as the On-call mode (interactive = true).
 
-Per default following checks are disabled but are defined in the configuration template and advised to set:
+When failover is triggered, conditions for a possible failover are checked. Per default
+- The slave was connected to the failed leader
+- The SQL thread is running so the slave was not stopped
+- The slave reply to PING_COM protocol
+- The IO_thread should be in connecting or stopped on all slaves (split brain detection from replication-manager to the master)
+
+Extra checks are disabled but are defined in the configuration template and advised to set:
 - Exceeding a given replication delay (maxdelay=0)
 - Failover did not happen previously in less than a given time interval (failover-time-limit=0)  
 - Failover limit was not reached (failover-limit=0)
 
-A user can force switchover or failover by ignoring those checks via the (rplchecks=false) flag or via the console "Replication Checks Change" button.
+A user can force switchover or failover on a late or stopped slave by ignoring those checks via the (rplchecks=false) flag or via the console "Replication Checks Change" button.
 
-Per default Semi-Sync replication status is not checked during failover, but this check can be enforced with semi- sync replication to enable to preserve OLD LEADER recovery at all costs, and do not failover if none of the slaves are in SYNC status.
+Semi-Sync replication status is not checked during failover, but this check can be enforced with semi- sync replication to enable to preserve OLD LEADER recovery at all costs, and do not failover if none of the slaves are in SYNC status.
 
 - Last semi sync status was SYNC  (failsync=false)  
 

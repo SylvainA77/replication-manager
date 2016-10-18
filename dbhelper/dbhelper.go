@@ -11,15 +11,15 @@ package dbhelper
 
 import (
 	"database/sql"
+	"fmt"
+	"github.com/jmoiron/sqlx"
+	//	"github.com/tanji/replication-manager/misc"
+	"hash/crc64"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
-  "github.com/jmoiron/sqlx"
-	"github.com/tanji/replication-manager/misc"
-	"hash/crc64"
-  "fmt"
 )
 
 const debug = false
@@ -151,29 +151,46 @@ func GetAddress(host string, port string, socket string) string {
 
 func GetProcesslist(db *sqlx.DB) []Processlist {
 	pl := []Processlist{}
-	err := db.Select(&pl, "SELECT id, user, host, `db` AS `database`, command, time_ms as time, state FROM INFORMATION_SCHEMA.PROCESSLIST")
+	err := db.Select(&pl, "SELECT Id, User, Host, `Db` AS `Database`, Command, Time_ms as Time, State FROM INFORMATION_SCHEMA.PROCESSLIST")
 	if err != nil {
 		log.Fatalln("ERROR: Could not get processlist", err)
 	}
 	return pl
 }
 
-func GetPrivileges(db *sqlx.DB, user string, host string) (Privileges, error) {
-	db.MapperFunc(strings.Title)
-	priv := Privileges{}
-	stmt := "SELECT Select_priv, Process_priv, Super_priv, Repl_slave_priv, Repl_client_priv, Reload_priv FROM mysql.user WHERE user = ? AND host = ?"
-	row := db.QueryRowx(stmt, user, host)
-	err := row.StructScan(&priv)
-	if err != nil && err == sql.ErrNoRows {
-		row := db.QueryRowx(stmt, user, "%")
-		err = row.StructScan(&priv)
-		if err != nil && err == sql.ErrNoRows {
-			row := db.QueryRowx(stmt, user, misc.GetLocalIP())
-			err = row.StructScan(&priv)
-			return priv, err
+func GetHostFromProcessList(db *sqlx.DB, user string) string {
+	pl := []Processlist{}
+	pl = GetProcesslist(db)
+	for i := range pl {
+		if pl[i].User == user {
+			return strings.Split(pl[i].Host, ":")[0]
 		}
-		return priv, err
 	}
+	return "N/A"
+}
+func GetPrivileges(db *sqlx.DB, user string, host string, ip string) (Privileges, error) {
+	db.MapperFunc(strings.Title)
+	splitip := strings.Split(ip, ".")
+
+	iprange1 := splitip[0] + ".%.%.%"
+	iprange2 := splitip[0] + "." + splitip[1] + ".%.%"
+	iprange3 := splitip[0] + "." + splitip[1] + "." + splitip[2] + ".%"
+	priv := Privileges{}
+	stmt := "SELECT MAX(Select_priv) as Select_priv, MAX(Process_priv) as Process_priv, MAX(Super_priv) as Super_priv, MAX(Repl_slave_priv) as Repl_slave_priv, MAX(Repl_client_priv) as Repl_client_priv, MAX(Reload_priv) as Reload_priv FROM mysql.user WHERE user = ? AND host IN(?,?,?,?,?,?,?,?,?)"
+	row := db.QueryRowx(stmt, user, host, ip, "%", ip+"/255.0.0.0", ip+"/255.255.0.0", ip+"/255.255.255.0", iprange1, iprange2, iprange3)
+	//	fmt.Println("'" + user + "',''" + host + "','" + ip + "', ''" + ip + "/255.0.0.0'" + ", ''" + ip + "/255.255.0.0'" + "','" + ip + "/255.255.255.0" + "','" + iprange1 + "','" + iprange2 + "','" + iprange3)
+	err := row.StructScan(&priv)
+	/*
+		if err != nil && err == sql.ErrNoRows {
+			row := db.QueryRowx(stmt, user, "%")
+			err = row.StructScan(&priv)
+			if err != nil && err == sql.ErrNoRows {
+				row := db.QueryRowx(stmt, user, misc.GetLocalIP())
+				err = row.StructScan(&priv)
+				return priv, err
+			}
+			return priv, err
+		} */
 	return priv, err
 }
 
@@ -201,7 +218,7 @@ func GetAllSlavesStatus(db *sqlx.DB) ([]SlaveStatus, error) {
 	return ss, err
 }
 
-func SetHeartbeatTable(db *sqlx.DB)  (error) {
+func SetHeartbeatTable(db *sqlx.DB) error {
 	stmt := "SET sql_log_bin=0"
 	_, err := db.Exec(stmt)
 	if err != nil {
@@ -221,29 +238,77 @@ func SetHeartbeatTable(db *sqlx.DB)  (error) {
 	return err
 }
 
-func WriteHeartbeat(db *sqlx.DB,uuid string, status string) (error) {
- 	stmt := "INSERT INTO replication_manager_schema.heartbeat(uuid,date,status) SELECT '" + uuid + "', NOW(),'" + status + "'"
+func WriteHeartbeat(db *sqlx.DB, uuid string, status string) error {
+	stmt := "SET sql_log_bin=0"
 	_, err := db.Exec(stmt)
+	if err != nil {
+		return err
+	}
+
+	stmt = "INSERT INTO replication_manager_schema.heartbeat(uuid,date,status) VALUES('" + uuid + "', NOW(),'" + status + "') ON DUPLICATE KEY UPDATE date=NOW(),status='" + status + "'"
+	_, err = db.Exec(stmt)
+	if err != nil {
+		return err
+	}
+	stmt = "DELETE FROM replication_manager_schema.heartbeat WHERE date < NOW() - INTERVAL 3 SECOND"
+	_, err = db.Exec(stmt)
+	if err != nil {
+		return err
+	}
 	return err
 }
 
-func SetMultiSourceRepl(db *sqlx.DB,master_host string, master_port string, master_user string, master_password string, master_filter string ) (error) {
-  crcTable := crc64.MakeTable(crc64.ECMA) // http://golang.org/pkg/hash/crc64/#pkg-constants
-	checksum64 :=fmt.Sprintf("%d", crc64.Checksum( []byte( master_host + ":" + master_port ), crcTable))
+func CheckHeartbeat(db *sqlx.DB, uuid string, status string) bool {
+	var count int
+	stmt := "SELECT count(*) FROM replication_manager_schema.heartbeat WHERE date > NOW() - INTERVAL 3 SECOND AND status IN ('A','F') and uuid<>'" + uuid + "'"
+	err := db.QueryRowx(stmt).Scan(&count)
+	if err != nil {
+		return true
+	}
+	if count > 0 {
+		return false
+	}
+	return true
+}
 
-	stmt := "CHANGE MASTER 'mrm_"+checksum64+"' TO master_host='" + master_host+ "', master_port=" + master_port+ ", master_user='"+master_user+ "', master_password='"+master_password+"' , master_use_gtid=slave_pos"
+func SetStatusActiveHeartbeat(db *sqlx.DB, uuid string, status string) error {
+	/*	stmt := "START TRANSACTION"
+		_, err := db.Exec(stmt)
+		if err != nil {
+			return err
+		}
+	*/
+	stmt := "TRUNCATE TABLE replication_manager_schema.heartbeat"
+	_, err := db.Exec(stmt)
+	if err != nil {
+		return err
+	}
+	err = WriteHeartbeat(db, uuid, status)
+	/*	stmt = "COMMIT"
+		_, err = db.Exec(stmt)
+		if err != nil {
+			return err
+		}*/
+	return err
+}
+
+func SetMultiSourceRepl(db *sqlx.DB, master_host string, master_port string, master_user string, master_password string, master_filter string) error {
+	crcTable := crc64.MakeTable(crc64.ECMA) // http://golang.org/pkg/hash/crc64/#pkg-constants
+	checksum64 := fmt.Sprintf("%d", crc64.Checksum([]byte(master_host+":"+master_port), crcTable))
+
+	stmt := "CHANGE MASTER 'mrm_" + checksum64 + "' TO master_host='" + master_host + "', master_port=" + master_port + ", master_user='" + master_user + "', master_password='" + master_password + "' , master_use_gtid=slave_pos"
 	_, err := db.Exec(stmt)
 	if err != nil {
 		return err
 	}
 	if master_filter != "" {
-	  stmt = "SET GLOBAL mrm_"+checksum64+".replicate_do_table='"+ master_filter +"'"
+		stmt = "SET GLOBAL mrm_" + checksum64 + ".replicate_do_table='" + master_filter + "'"
 		_, err = db.Exec(stmt)
 		if err != nil {
 			return err
 		}
 	}
-	stmt = "START SLAVE 'mrm_"+checksum64+"'"
+	stmt = "START SLAVE 'mrm_" + checksum64 + "'"
 	_, err = db.Exec(stmt)
 	if err != nil {
 		return err
@@ -251,8 +316,6 @@ func SetMultiSourceRepl(db *sqlx.DB,master_host string, master_port string, mast
 
 	return err
 }
-
-
 
 func ResetAllSlaves(db *sqlx.DB) error {
 	ss, err := GetAllSlavesStatus(db)
@@ -591,7 +654,7 @@ func CheckHostAddr(h string) (string, error) {
 func GetSpiderShardUrl(db *sqlx.DB) (string, error) {
 	var value string
 	value = ""
-	err := db.QueryRowx("select  coalesce(group_concat(distinct concat(coalesce(st.host,s.host ),':',coalesce(st.port,s.port))),'') as value  from mysql.spider_tables st left join mysql.servers s on st.server=s.server_name").Scan(&value)
+	err := db.QueryRowx("select coalesce(group_concat(distinct concat(coalesce(st.host,s.host ),':',coalesce(st.port,s.port))),'') as value  from mysql.spider_tables st left join mysql.servers s on st.server=s.server_name").Scan(&value)
 	if err != nil {
 		log.Println("ERROR: Could not get spider shards", err)
 	}
@@ -624,8 +687,6 @@ func GetSpiderTableToSync(db *sqlx.DB) (map[string]SpiderTableNoSync, error) {
 	}
 	return vars, err
 }
-
-
 
 func runPreparedExecConcurrent(db *sqlx.DB, n int, co int) error {
 	stmt, err := db.Prepare("UPDATE replication_manager_schema.bench SET val=val+1 ")
@@ -711,22 +772,22 @@ func benchPreparedExecConcurrent16(db *sqlx.DB, n int) error {
 	return runPreparedExecConcurrent(db, n, 16)
 }
 
-func InjectLongTrx(db *sqlx.DB,time int) error {
-_, err := db.Exec("set binlog_format='STATEMENT'")
-_, err = db.Exec("INSERT INTO replication_manager_schema.bench  select  sleep("+ fmt.Sprintf("%d",time)  + ") from dual")
-if err != nil {
-	return err
-}
- return nil
+func InjectLongTrx(db *sqlx.DB, time int) error {
+	_, err := db.Exec("set binlog_format='STATEMENT'")
+	_, err = db.Exec("INSERT INTO replication_manager_schema.bench  select  sleep(" + fmt.Sprintf("%d", time) + ") from dual")
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func benchWarmup(db *sqlx.DB) error {
 	db.SetMaxIdleConns(16)
-  _,  err := db.Exec("CREATE DATABASE IF NOT EXISTS  replication_manager_schema")
+	_, err := db.Exec("CREATE DATABASE IF NOT EXISTS  replication_manager_schema")
 	if err != nil {
 		return err
 	}
-  _, err = db.Exec("CREATE OR REPLACE TABLE replication_manager_schema.bench(val bigint unsigned )")
+	_, err = db.Exec("CREATE OR REPLACE TABLE replication_manager_schema.bench(val bigint unsigned )")
 	if err != nil {
 		return err
 	}
@@ -735,8 +796,7 @@ func benchWarmup(db *sqlx.DB) error {
 		return err
 	}
 
-
-for i := 0; i < 2; i++ {
+	for i := 0; i < 2; i++ {
 		rows, err := db.Query("SELECT val FROM replication_manager_schema.bench")
 		if err != nil {
 			return err
@@ -749,8 +809,8 @@ for i := 0; i < 2; i++ {
 	return nil
 }
 
-func WriteConcurrent2(dsn string, qt int)  (string, error) {
-var err error
+func WriteConcurrent2(dsn string, qt int) (string, error) {
+	var err error
 
 	bs := BenchmarkSuite{
 		WarmUp:      benchWarmup,
@@ -758,13 +818,12 @@ var err error
 		PrintStats:  true,
 	}
 
-	if err = bs.AddDriver("mysql", "mysql", dsn ); err != nil {
-	  return "", err
+	if err = bs.AddDriver("mysql", "mysql", dsn); err != nil {
+		return "", err
 	}
 
 	bs.AddBenchmark("PreparedExecConcurrent2", qt, benchPreparedExecConcurrent2)
 
-
 	result := bs.Run()
-  return result, nil
+	return result, nil
 }

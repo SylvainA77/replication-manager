@@ -50,7 +50,8 @@ var (
 	swChan         = make(chan bool)
 	repmgrHostname string
 	test           bool
-	run_uuid       uuid.UUID
+	run_uuid       string
+	run_status     string
 )
 
 // Configuration variables - do not put global variables in that list
@@ -70,7 +71,7 @@ var (
 	prefMaster         string
 	ignoreSrv          string
 	waitKill           int64
-	waitTrx           int64
+	waitTrx            int64
 	readonly           bool
 	maxfail            int
 	autorejoin         bool
@@ -102,8 +103,9 @@ var (
 )
 
 func init() {
+	run_uuid = uuid.NewV4().String()
+	run_status = "A"
 	var errLog = mysql.Logger(log.New(ioutil.Discard, "", 0))
-	run_uuid = uuid.NewV4()
 	mysql.SetLogger(errLog)
 	rootCmd.AddCommand(switchoverCmd)
 	rootCmd.AddCommand(failoverCmd)
@@ -567,5 +569,14 @@ func toggleInteractive() {
 	} else {
 		interactive = true
 		logprintf("INFO : Failover monitor switched to manual mode")
+	}
+}
+
+func getActiveStatus() {
+	for _, sv := range servers {
+		err := dbhelper.SetStatusActiveHeartbeat(sv.Conn, run_uuid, "A")
+		if err == nil {
+			run_status = "A"
+		}
 	}
 }
